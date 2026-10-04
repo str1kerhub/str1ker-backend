@@ -1,9 +1,11 @@
+// language: JavaScript, file: server.js, runtime: Node 20+
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const app = express();
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // LootLabs manda form-encoded às vezes
 
 const DB_FILE = './keys.json';
 let DB = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE)) : {};
@@ -19,12 +21,24 @@ function generateKey() {
 }
 
 // ═══ ENDPOINT 1 — POSTBACK (LootLabs chama quando alguém completa a task) ═══
-app.get('/postback/lootlabs', (req, res) => {
-  const { puid } = req.query; // puid = UserId do Roblox
+function handlePostback(req, res) {
+  // mescla query + body — LootLabs alterna entre GET e POST
+  const p = { ...req.query, ...req.body };
+
+  // aceita vários nomes: puid direto, ou os placeholders da LootLabs
+  const puid = p.puid
+            || p.unique_id
+            || p.UNIQUE_ID
+            || p.sub_id
+            || p.s1;
 
   if (!puid) {
+    console.log('[Postback] recebido sem puid:', p);
     return res.status(400).send('missing puid');
   }
+
+  const ip = p.ip || p.IP || req.ip;
+  const click_id = p.click_id || p.CLICK_ID || null;
 
   // Se já existe uma key ativa pra esse puid, não gera outra
   const existing = Object.entries(DB).find(([k, v]) => v.puid === puid && Date.now() < v.expires);
@@ -36,16 +50,21 @@ app.get('/postback/lootlabs', (req, res) => {
   // Gera key nova
   const key = generateKey();
   DB[key] = {
-    puid: puid,
+    puid: String(puid),
     tier: 'free',
     expires: Date.now() + 12 * 60 * 60 * 1000, // 12 horas
     created: Date.now(),
+    ip: ip,
+    click_id: click_id,
   };
   saveDB();
 
-  console.log(`[Postback] ${puid} → key ${key}`);
+  console.log(`[Postback] puid=${puid} ip=${ip} click=${click_id} → key ${key}`);
   res.send('OK');
-});
+}
+
+app.get('/postback/lootlabs', handlePostback);
+app.post('/postback/lootlabs', handlePostback);
 
 // ═══ ENDPOINT 2 — GET KEY BY PUID (cliente pergunta "qual é minha key?") ═══
 app.get('/get-key/:puid', (req, res) => {
