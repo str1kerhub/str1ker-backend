@@ -4,12 +4,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const app = express();
 
-app.set('trust proxy', true);   // ← essa linha
-
+app.set('trust proxy', true);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// CORS manual
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -19,83 +17,132 @@ app.use((req, res, next) => {
 });
 
 const DB_FILE = './keys.json';
-let DB = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE)) : {};
-
-// IPs que pediram key nos últimos 5 min
 const PENDING_FILE = './pending.json';
+const RATE_FILE = './rate.json';
+
+let DB = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE)) : {};
 let PENDING = fs.existsSync(PENDING_FILE) ? JSON.parse(fs.readFileSync(PENDING_FILE)) : {};
+let RATE = fs.existsSync(RATE_FILE) ? JSON.parse(fs.readFileSync(RATE_FILE)) : {};
 
 function saveDB() { fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2)); }
 function savePending() { fs.writeFileSync(PENDING_FILE, JSON.stringify(PENDING, null, 2)); }
+function saveRate() { fs.writeFileSync(RATE_FILE, JSON.stringify(RATE, null, 2)); }
 
-function generateKey() {
-  const raw = crypto.randomBytes(4).toString('hex').toUpperCase();
-  return `STR1KER-${raw.slice(0, 4)}-${raw.slice(4, 8)}`;
-}
-
-// normaliza IP (remove IPv6 prefix, etc)
 function normIP(raw) {
   if (!raw) return null;
   let ip = String(raw).trim();
   if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip.includes(',')) ip = ip.split(',')[0].trim();
   return ip;
 }
 
-// ═══ ENDPOINT 0 — REGISTER (HTML chama antes de abrir LootLabs) ═══
+function getIP(req) {
+  return normIP(req.headers['x-forwarded-for'] || req.ip || req.connection.remoteAddress);
+}
+
+function generateKey() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sem 0/O/1/I
+  let key = 'STR1KER';
+  for (let g = 0; g < 4; g++) {
+    key += '-';
+    for (let i = 0; i < 4; i++) key += chars[crypto.randomInt(0, chars.length)];
+  }
+  return key;
+}
+
+function generateToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+// ─── rate limit ───
+function rateLimit(ip, bucket, max, windowMs) {
+  const key = `${ip}:${bucket}`;
+  const now = Date.now();
+  const r = RATE[key];
+  if (!r || now > r.resetAt) {
+    RATE[key] = { count: 1, resetAt: now + windowMs };
+    return true;
+  }
+  if (r.count >= max) return false;
+  r.count++;
+  return true;
+}
+
+// ═══ /register ═══
 app.post('/register', (req, res) => {
-  const ip = normIP(req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress);
+  const ip = getIP(req);
   const puid = (req.body.puid || '').toString();
 
   if (!ip) return res.status(400).json({ error: 'no_ip' });
+  if (!puid || !/^\d{10,20}$/.test(puid)) return res.status(400).json({ error: 'bad_puid' });
 
-  PENDING[ip] = {
-    puid: puid || null,
-    since: Date.now(),
-  };
+  if (!rateLimit(ip, 'register', 6, 60_000)) {
+    console.log(`[Register] rate limited ip=${ip}`);
+    return res.status(429).json({ error: 'rate_limited' });
+  }
+
+  const token = generateToken();
+  PENDING[ip] = { puid, token, since: Date.now(), used: false };
   savePending();
 
-  console.log(`[Register] ip=${ip} puid=${puid || 'none'}`);
-  res.json({ ok: true, ip });
+  console.log(`[Register] ip=${ip} puid=${puid} token=${token.slice(0,8)}...`);
+  res.json({ ok: true, token });
 });
 
-// ═══ POSTBACK ═══
+// ═══ postback ═══
 function handlePostback(req, res) {
   const p = { ...req.query, ...req.body };
-  const ip = normIP(p.ip || p.IP || req.ip);
+  const ip = normIP(p.ip || p.IP || getIP(req));
   const click_id = p.click_id || p.CLICK_ID || null;
+  const signature = p.signature || p.sig || null;
 
   if (!ip) return res.status(400).send('missing ip');
 
-  // acha um pending desse IP nos últimos 5 min
+  // verificação HMAC opcional — ativa se LootLabs mandar signature
+  const SECRET = process.env.POSTBACK_SECRET;
+  if (SECRET && signature) {
+    const expected = crypto.createHmac('sha256', SECRET)
+      .update(String(click_id || '') + ip)
+      .digest('hex');
+    if (signature !== expected) {
+      console.log(`[Postback] bad signature ip=${ip}`);
+      return res.status(403).send('bad signature');
+    }
+  }
+
   const pend = PENDING[ip];
   const now = Date.now();
 
   if (!pend || (now - pend.since) > 5 * 60 * 1000) {
-    console.log(`[Postback] ip=${ip} sem register ativo — descartado`);
+    console.log(`[Postback] ip=${ip} sem register ativo`);
     return res.status(200).send('no pending match');
   }
+  if (pend.used) {
+    console.log(`[Postback] ip=${ip} token já usado`);
+    return res.status(200).send('already used');
+  }
 
-  const puid = pend.puid || ip;
+  const puid = pend.puid;
 
-  // evita gerar duplicado
   const existing = Object.entries(DB).find(([k, v]) => v.puid === puid && Date.now() < v.expires);
   if (existing) {
+    pend.used = true; savePending();
     console.log(`[Postback] ${puid} já tem key ativa`);
-    delete PENDING[ip]; savePending();
     return res.send('OK - already has key');
   }
 
   const key = generateKey();
   DB[key] = {
     puid: String(puid),
-    ip: ip,
+    ip,
     tier: 'free',
     expires: Date.now() + 12 * 60 * 60 * 1000,
     created: Date.now(),
-    click_id: click_id,
+    click_id,
   };
   saveDB();
-  delete PENDING[ip];
+
+  pend.used = true;
   savePending();
 
   console.log(`[Postback] ip=${ip} puid=${puid} click=${click_id} → key ${key}`);
@@ -105,7 +152,31 @@ function handlePostback(req, res) {
 app.get('/postback/lootlabs', handlePostback);
 app.post('/postback/lootlabs', handlePostback);
 
-// ═══ GET KEY BY PUID ═══
+// ═══ /get-key-by-ip (agora exige token) ═══
+app.get('/get-key-by-ip', (req, res) => {
+  const ip = getIP(req);
+  const token = (req.query.token || '').toString();
+
+  if (!ip) return res.json({ found: false });
+  if (!token) return res.json({ found: false, error: 'no_token' });
+
+  if (!rateLimit(ip, 'poll', 200, 60_000)) {
+    return res.status(429).json({ found: false, error: 'rate_limited' });
+  }
+
+  const pend = PENDING[ip];
+  if (!pend || pend.token !== token) {
+    return res.json({ found: false, error: 'bad_token' });
+  }
+
+  const entry = Object.entries(DB).find(([k, v]) => v.ip === ip && Date.now() < v.expires);
+  if (!entry) return res.json({ found: false });
+
+  const [key, data] = entry;
+  res.json({ found: true, key, expires: data.expires });
+});
+
+// ═══ /get-key/:puid (mantido, ainda útil) ═══
 app.get('/get-key/:puid', (req, res) => {
   const { puid } = req.params;
   const entry = Object.entries(DB).find(([k, v]) => v.puid === puid);
@@ -115,19 +186,7 @@ app.get('/get-key/:puid', (req, res) => {
   res.json({ found: true, key, expires: data.expires });
 });
 
-// ═══ GET KEY BY IP (fallback — HTML consulta pelo próprio IP) ═══
-app.get('/get-key-by-ip', (req, res) => {
-  const ip = normIP(req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress);
-  if (!ip) return res.json({ found: false });
-
-  const entry = Object.entries(DB).find(([k, v]) => v.ip === ip && Date.now() < v.expires);
-  if (!entry) return res.json({ found: false });
-
-  const [key, data] = entry;
-  res.json({ found: true, key, expires: data.expires });
-});
-
-// ═══ VALIDATE ═══
+// ═══ /validate ═══
 app.post('/validate', (req, res) => {
   const { key } = req.body;
   if (!key) return res.json({ valid: false, reason: 'no_key' });
@@ -142,7 +201,7 @@ app.post('/validate', (req, res) => {
   });
 });
 
-// ═══ ADMIN ═══
+// ═══ /admin/create ═══
 app.post('/admin/create', (req, res) => {
   const { admin_secret, tier, days } = req.body;
   if (admin_secret !== (process.env.ADMIN_SECRET || 'change-me')) {
@@ -159,19 +218,23 @@ app.post('/admin/create', (req, res) => {
   res.json({ key, tier, expires_in_days: days || 30 });
 });
 
-// ═══ HEALTH ═══
+// ═══ health ═══
 app.get('/', (req, res) => {
   res.json({ status: 'ok', keys: Object.keys(DB).length, pending: Object.keys(PENDING).length });
 });
 
-// limpa pending antigo a cada minuto
+// limpa pending/rate antigos
 setInterval(() => {
   const now = Date.now();
-  let changed = false;
+  let cp = false, cr = false;
   for (const [ip, p] of Object.entries(PENDING)) {
-    if (now - p.since > 10 * 60 * 1000) { delete PENDING[ip]; changed = true; }
+    if (now - p.since > 10 * 60 * 1000) { delete PENDING[ip]; cp = true; }
   }
-  if (changed) savePending();
+  for (const [k, r] of Object.entries(RATE)) {
+    if (now > r.resetAt) { delete RATE[k]; cr = true; }
+  }
+  if (cp) savePending();
+  if (cr) saveRate();
 }, 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
