@@ -10,7 +10,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -19,14 +19,17 @@ app.use((req, res, next) => {
 const DB_FILE = './keys.json';
 const PENDING_FILE = './pending.json';
 const RATE_FILE = './rate.json';
+const PROF_FILE = './profiles.json';
 
 let DB = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE)) : {};
 let PENDING = fs.existsSync(PENDING_FILE) ? JSON.parse(fs.readFileSync(PENDING_FILE)) : {};
 let RATE = fs.existsSync(RATE_FILE) ? JSON.parse(fs.readFileSync(RATE_FILE)) : {};
+let PROFILES = fs.existsSync(PROF_FILE) ? JSON.parse(fs.readFileSync(PROF_FILE)) : {};
 
 function saveDB() { fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2)); }
 function savePending() { fs.writeFileSync(PENDING_FILE, JSON.stringify(PENDING, null, 2)); }
 function saveRate() { fs.writeFileSync(RATE_FILE, JSON.stringify(RATE, null, 2)); }
+function saveProfiles() { fs.writeFileSync(PROF_FILE, JSON.stringify(PROFILES, null, 2)); }
 
 function normIP(raw) {
   if (!raw) return null;
@@ -41,7 +44,7 @@ function getIP(req) {
 }
 
 function generateKey() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sem 0/O/1/I
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let key = 'STR1KER';
   for (let g = 0; g < 4; g++) {
     key += '-';
@@ -54,7 +57,6 @@ function generateToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
-// ─── rate limit ───
 function rateLimit(ip, bucket, max, windowMs) {
   const key = `${ip}:${bucket}`;
   const now = Date.now();
@@ -98,7 +100,6 @@ function handlePostback(req, res) {
 
   if (!ip) return res.status(400).send('missing ip');
 
-  // verificação HMAC opcional — ativa se LootLabs mandar signature
   const SECRET = process.env.POSTBACK_SECRET;
   if (SECRET && signature) {
     const expected = crypto.createHmac('sha256', SECRET)
@@ -152,7 +153,7 @@ function handlePostback(req, res) {
 app.get('/postback/lootlabs', handlePostback);
 app.post('/postback/lootlabs', handlePostback);
 
-// ═══ /get-key-by-ip (agora exige token) ═══
+// ═══ /get-key-by-ip ═══
 app.get('/get-key-by-ip', (req, res) => {
   const ip = getIP(req);
   const token = (req.query.token || '').toString();
@@ -176,7 +177,7 @@ app.get('/get-key-by-ip', (req, res) => {
   res.json({ found: true, key, expires: data.expires });
 });
 
-// ═══ /get-key/:puid (mantido, ainda útil) ═══
+// ═══ /get-key/:puid ═══
 app.get('/get-key/:puid', (req, res) => {
   const { puid } = req.params;
   const entry = Object.entries(DB).find(([k, v]) => v.puid === puid);
@@ -218,9 +219,52 @@ app.post('/admin/create', (req, res) => {
   res.json({ key, tier, expires_in_days: days || 30 });
 });
 
+// ═══ /profiles ═══
+app.post('/profiles/:puid', (req, res) => {
+  const { puid } = req.params;
+  const { name, data } = req.body;
+  if (!puid || !name || !data) return res.status(400).json({ error: 'missing' });
+  if (!/^[a-zA-Z0-9_\- ]{1,32}$/.test(name)) return res.status(400).json({ error: 'bad_name' });
+  if (!PROFILES[puid]) PROFILES[puid] = {};
+  PROFILES[puid][name] = { data, updated: Date.now() };
+  saveProfiles();
+  console.log(`[Profiles] ${puid} saved "${name}"`);
+  res.json({ ok: true });
+});
+
+app.get('/profiles/:puid', (req, res) => {
+  const { puid } = req.params;
+  const list = PROFILES[puid] || {};
+  const out = Object.entries(list).map(([name, v]) => ({ name, updated: v.updated }));
+  out.sort((a, b) => b.updated - a.updated);
+  res.json({ profiles: out });
+});
+
+app.get('/profiles/:puid/:name', (req, res) => {
+  const { puid, name } = req.params;
+  const p = PROFILES[puid] && PROFILES[puid][name];
+  if (!p) return res.status(404).json({ error: 'not_found' });
+  res.json({ name, data: p.data, updated: p.updated });
+});
+
+app.delete('/profiles/:puid/:name', (req, res) => {
+  const { puid, name } = req.params;
+  if (PROFILES[puid]) {
+    delete PROFILES[puid][name];
+    saveProfiles();
+    console.log(`[Profiles] ${puid} deleted "${name}"`);
+  }
+  res.json({ ok: true });
+});
+
 // ═══ health ═══
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', keys: Object.keys(DB).length, pending: Object.keys(PENDING).length });
+  res.json({
+    status: 'ok',
+    keys: Object.keys(DB).length,
+    pending: Object.keys(PENDING).length,
+    profiles: Object.keys(PROFILES).length,
+  });
 });
 
 // limpa pending/rate antigos
