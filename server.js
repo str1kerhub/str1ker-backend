@@ -5,7 +5,16 @@ const fs = require('fs');
 const app = express();
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // LootLabs manda form-encoded às vezes
+app.use(express.urlencoded({ extended: true }));
+
+// ═══ CORS MANUAL — sem dependência ═══
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 const DB_FILE = './keys.json';
 let DB = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE)) : {};
@@ -121,7 +130,7 @@ app.post('/admin/create', (req, res) => {
   res.json({ key, tier, expires_in_days: days || 30 });
 });
 
-// ═══ ENDPOINT 5 — HEALTH (só pra testar se tá rodando) ═══
+// ═══ ENDPOINT 5 — HEALTH ═══
 app.get('/', (req, res) => {
   res.json({ status: 'ok', keys_count: Object.keys(DB).length });
 });
