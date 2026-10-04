@@ -35,11 +35,12 @@ function handlePostback(req, res) {
   const p = { ...req.query, ...req.body };
 
   // aceita vários nomes: puid direto, ou os placeholders da LootLabs
-  const puid = p.puid
-            || p.unique_id
-            || p.UNIQUE_ID
-            || p.sub_id
-            || p.s1;
+  const puid = p.sub_id
+          || p.s1
+          || p.unique_id
+          || p.UNIQUE_ID
+          || p.click_id
+          || p.puid;
 
   if (!puid) {
     console.log('[Postback] recebido sem puid:', p);
