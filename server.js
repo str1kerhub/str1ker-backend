@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const app = express();
 
+app.set('trust proxy', true);   // ← essa linha
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
