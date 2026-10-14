@@ -11,7 +11,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-admin-secret');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -68,6 +68,22 @@ function rateLimit(ip, bucket, max, windowMs) {
   if (r.count >= max) return false;
   r.count++;
   return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADMIN AUTH
+// ═══════════════════════════════════════════════════════════════════════════
+
+function requireAdmin(req, res, next) {
+  const secret = req.headers['x-admin-secret']
+    || (req.body && (req.body.admin_secret || req.body.secret));
+
+  const realSecret = process.env.ADMIN_SECRET || 'change-me';
+
+  if (secret !== realSecret) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
 }
 
 // ═══ /register ═══
@@ -147,6 +163,28 @@ function handlePostback(req, res) {
   savePending();
 
   console.log(`[Postback] ip=${ip} puid=${puid} click=${click_id} → key ${key}`);
+
+  // webhook opcional
+  const wurl = process.env.DISCORD_WEBHOOK;
+  if (wurl) {
+    fetch(wurl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        embeds: [{
+          title: 'Nova key gerada (LootLabs)',
+          color: 0x3b82f6,
+          fields: [
+            { name: 'Key', value: '`' + key + '`' },
+            { name: 'PUID', value: '`' + puid + '`', inline: true },
+            { name: 'IP', value: '`' + ip + '`', inline: true },
+          ],
+          timestamp: new Date().toISOString(),
+        }],
+      }),
+    }).catch(() => {});
+  }
+
   res.send('OK');
 }
 
@@ -189,11 +227,19 @@ app.get('/get-key/:puid', (req, res) => {
 
 // ═══ /validate ═══
 app.post('/validate', (req, res) => {
-  const { key } = req.body;
+  const { key, puid, username } = req.body;
   if (!key) return res.json({ valid: false, reason: 'no_key' });
   const data = DB[key];
   if (!data) return res.json({ valid: false, reason: 'not_found' });
   if (Date.now() > data.expires) return res.json({ valid: false, reason: 'expired' });
+
+  if (!data.usedBy && puid) {
+    data.usedBy = puid;
+    data.usedByUsername = username || null;
+    data.firstUsedAt = Date.now();
+    saveDB();
+  }
+
   res.json({
     valid: true,
     tier: data.tier,
@@ -202,21 +248,167 @@ app.post('/validate', (req, res) => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ADMIN ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════
+
 // ═══ /admin/create ═══
-app.post('/admin/create', (req, res) => {
-  const { admin_secret, tier, days } = req.body;
-  if (admin_secret !== (process.env.ADMIN_SECRET || 'change-me')) {
-    return res.status(403).json({ error: 'forbidden' });
+// Aceita: { hours, count } OU { days, count } OU { admin_secret, days, tier }
+app.post('/admin/create', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const count = Math.min(Math.max(parseInt(body.count) || 1, 1), 50);
+
+  let durationH = 24;
+  if (typeof body.hours === 'number' && body.hours > 0) {
+    durationH = body.hours;
+  } else if (typeof body.days === 'number' && body.days > 0) {
+    durationH = body.days * 24;
   }
-  const key = generateKey();
-  DB[key] = {
-    puid: null,
-    tier: tier || 'premium',
-    expires: Date.now() + (days || 30) * 24 * 60 * 60 * 1000,
-    created: Date.now(),
-  };
+
+  const tier = body.tier || 'premium';
+  const now = Date.now();
+  const out = [];
+
+  for (let i = 0; i < count; i++) {
+    const key = generateKey();
+    DB[key] = {
+      puid: null,
+      tier,
+      expires: now + durationH * 3600 * 1000,
+      created: now,
+      admin: true,
+    };
+    out.push(key);
+  }
   saveDB();
-  res.json({ key, tier, expires_in_days: days || 30 });
+
+  console.log(`[Admin] ${count} key(s) geradas · ${durationH}h · tier=${tier}`);
+
+  const wurl = process.env.DISCORD_WEBHOOK;
+  if (wurl) {
+    fetch(wurl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        embeds: [{
+          title: 'Nova(s) key(s) geradas (Admin)',
+          color: 0x3b82f6,
+          fields: [
+            { name: 'Quantidade', value: String(count), inline: true },
+            { name: 'Duração', value: durationH + 'h', inline: true },
+            { name: 'Tier', value: tier, inline: true },
+            { name: 'Keys', value: '```' + out.join('\n') + '```' },
+          ],
+          timestamp: new Date().toISOString(),
+        }],
+      }),
+    }).catch(() => {});
+  }
+
+  res.json({ ok: true, keys: out, expiresInHours: durationH, tier });
+});
+
+// ═══ /admin/keys ═══
+app.get('/admin/keys', requireAdmin, (req, res) => {
+  const now = Date.now();
+  const list = Object.entries(DB).map(([key, v]) => ({
+    key,
+    createdAt: v.created,
+    expiresAt: v.expires,
+    expired: v.expires < now,
+    tier: v.tier || 'free',
+    used: !!v.usedBy,
+    usedBy: v.usedBy || null,
+    usedByUsername: v.usedByUsername || null,
+    admin: !!v.admin,
+  }));
+  list.sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ ok: true, total: list.length, keys: list });
+});
+
+// ═══ /admin/revoke ═══
+app.post('/admin/revoke', requireAdmin, (req, res) => {
+  const { key } = req.body || {};
+  if (!key || !DB[key]) return res.status(404).json({ error: 'not_found' });
+  delete DB[key];
+  saveDB();
+  console.log(`[Admin] key revogada: ${key}`);
+  res.json({ ok: true });
+});
+
+// ═══ /admin/stats ═══
+app.get('/admin/stats', requireAdmin, (req, res) => {
+  const now = Date.now();
+  let active = 0, expired = 0, used = 0;
+  for (const k of Object.values(DB)) {
+    if (k.expires < now) expired++;
+    else active++;
+    if (k.usedBy) used++;
+  }
+  res.json({
+    ok: true,
+    total: Object.keys(DB).length,
+    active,
+    expired,
+    used,
+    pending: Object.keys(PENDING).length,
+    profiles: Object.keys(PROFILES).length,
+  });
+});
+
+// ═══ /admin/killswitch ═══
+app.post('/admin/killswitch', requireAdmin, (req, res) => {
+  const enable = req.body && req.body.enable === true;
+  process.env.KILLSWITCH = enable ? 'false' : 'true';
+  res.json({ ok: true, enabled: process.env.KILLSWITCH !== 'true' });
+});
+
+// ═══ /status ═══
+app.get('/status', (req, res) => {
+  res.json({ enabled: process.env.KILLSWITCH !== 'true' });
+});
+
+// ═══ /version ═══
+app.get('/version', (req, res) => {
+  res.json({
+    version: 4,
+    url: 'https://raw.githubusercontent.com/str1kerhub/str1ker1/main/str1ker_pvp.lua',
+  });
+});
+
+// ═══ /log ═══
+const logBucket = new Map();
+app.post('/log', (req, res) => {
+  const { event, data, user } = req.body || {};
+  const ip = getIP(req) || 'unknown';
+  const now = Date.now();
+
+  const recent = (logBucket.get(ip) || []).filter(t => now - t < 60_000);
+  if (recent.length > 30) return res.status(429).json({ ok: false });
+  recent.push(now);
+  logBucket.set(ip, recent);
+
+  const wurl = process.env.DISCORD_WEBHOOK;
+  if (wurl) {
+    fetch(wurl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        embeds: [{
+          title: 'Str1ker · ' + (event || 'event'),
+          color: 0x3b82f6,
+          fields: [
+            { name: 'User', value: '`' + (user || '?') + '`', inline: true },
+            { name: 'IP', value: '`' + ip + '`', inline: true },
+            { name: 'Data', value: '```' + JSON.stringify(data || {}).slice(0, 900) + '```' },
+          ],
+          timestamp: new Date().toISOString(),
+        }],
+      }),
+    }).catch(() => {});
+  }
+
+  res.json({ ok: true });
 });
 
 // ═══ /profiles ═══
