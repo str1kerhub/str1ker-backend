@@ -164,7 +164,6 @@ function handlePostback(req, res) {
 
   console.log(`[Postback] ip=${ip} puid=${puid} click=${click_id} → key ${key}`);
 
-  // webhook opcional
   const wurl = process.env.DISCORD_WEBHOOK;
   if (wurl) {
     fetch(wurl, {
@@ -252,8 +251,6 @@ app.post('/validate', (req, res) => {
 // ADMIN ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ═══ /admin/create ═══
-// Aceita: { hours, count } OU { days, count } OU { admin_secret, days, tier }
 app.post('/admin/create', requireAdmin, (req, res) => {
   const body = req.body || {};
   const count = Math.min(Math.max(parseInt(body.count) || 1, 1), 50);
@@ -308,7 +305,6 @@ app.post('/admin/create', requireAdmin, (req, res) => {
   res.json({ ok: true, keys: out, expiresInHours: durationH, tier });
 });
 
-// ═══ /admin/keys ═══
 app.get('/admin/keys', requireAdmin, (req, res) => {
   const now = Date.now();
   const list = Object.entries(DB).map(([key, v]) => ({
@@ -326,7 +322,6 @@ app.get('/admin/keys', requireAdmin, (req, res) => {
   res.json({ ok: true, total: list.length, keys: list });
 });
 
-// ═══ /admin/revoke ═══
 app.post('/admin/revoke', requireAdmin, (req, res) => {
   const { key } = req.body || {};
   if (!key || !DB[key]) return res.status(404).json({ error: 'not_found' });
@@ -336,7 +331,6 @@ app.post('/admin/revoke', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// ═══ /admin/stats ═══
 app.get('/admin/stats', requireAdmin, (req, res) => {
   const now = Date.now();
   let active = 0, expired = 0, used = 0;
@@ -356,7 +350,6 @@ app.get('/admin/stats', requireAdmin, (req, res) => {
   });
 });
 
-// ═══ /admin/killswitch ═══
 app.post('/admin/killswitch', requireAdmin, (req, res) => {
   const enable = req.body && req.body.enable === true;
   process.env.KILLSWITCH = enable ? 'false' : 'true';
@@ -459,7 +452,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// limpa pending/rate antigos
 setInterval(() => {
   const now = Date.now();
   let cp = false, cr = false;
